@@ -3,9 +3,9 @@
 #include <vector>
 #include <iomanip>
 
-#define CITY_MAX_NUM  5
+#define CITY_MAX_NUM  20
 #define OUTPUT_WIDE 3
-#define CPU_NUM 4
+#define CPU_NUM 8
 using namespace std;
 
 bool isNumber(char num) {
@@ -20,7 +20,7 @@ void output();
 
 int diagram[CITY_MAX_NUM][CITY_MAX_NUM];
 int city_num;
-
+int divide_time = 0;
 
 /*************************************************************/
 /****************  Data Structure Definition  ****************/
@@ -125,6 +125,24 @@ struct tour_stack_t {
         return (this->head == nullptr);
     }
 
+    node_t *pop_bottom_element() {
+        if (this->is_empty()) { return nullptr; }
+        else if (length == 1) {
+            this->head = nullptr;
+            this->tail = nullptr;
+            length--;
+            return head;
+        } else {
+            auto res = head;
+            head=head->next;
+            head->prev = head;
+            res->prev = nullptr;
+            res->next = nullptr;
+            length--;
+            return res;
+        }
+    }
+
     void push(node_t *node) {
         if (this->is_empty()) {
             head = node;
@@ -172,22 +190,26 @@ struct tour_stack_t {
     }
 };
 
-struct tour_queue_t{
-    node_t* head;
-    node_t* tail;
+struct tour_queue_t {
+    node_t *head;
+    node_t *tail;
     int length;
-    tour_queue_t(){
+
+    tour_queue_t() {
         head = nullptr;
         tail = nullptr;
         length = 0;
     }
-    bool is_empty(){
+
+    bool is_empty() {
         return this->length == 0;
     }
+
     void push(tour_t *tour) {
         node_t *node = new node_t(tour);
         push(node);
     }
+
     void push(node_t *node) {
         if (this->is_empty()) {
             head = node;
@@ -210,7 +232,8 @@ struct tour_queue_t{
             length++;
         }
     }
-    void pop(){
+
+    void pop() {
         if (is_empty()) { return; }
         if (length == 1) {
             head = nullptr;
@@ -223,6 +246,7 @@ struct tour_queue_t{
         }
         length--;
     }
+
     node_t *peek() {
         if (is_empty()) return nullptr;
         return this->tail->deep_copy();
@@ -244,22 +268,61 @@ tour_t *best_tour = new tour_t();
  * 与并行相关的全局变量
  * */
 pthread_mutex_t mutex_best_tour;
+pthread_mutex_t mutex_thread_cmd;
 int thread_in_con_wait;
 int thread_cout;
-pthread_t* thread_handles;
-
-
-
+pthread_t *thread_handles;
+volatile int active_thread_num;
+bool running = false;
 
 /*****************************************************/
 /****************  Packaged Function  ****************/
 /*****************************************************/
-void * tsp(void *tour){
-    tour_t* base_tour = (tour_t*) tour;
+
+void add_thread_num(pthread_t thread) {
+    active_thread_num++;
+    cout << "Thread NO." << active_thread_num << " has created. Thread id : " << thread <<"\t\t"<<active_thread_num<<" threads remains" << endl;
+}
+void add_thread_num_new_divided(pthread_t thread){
+    active_thread_num++;
+    divide_time++;
+    cout<<"Divided mission. new thread: "<<thread<<"\t\t"<<active_thread_num<<" threads remains"<<endl;
+}
+
+void sub_thread_num() {
+    active_thread_num--;
+    cout << "One Thread has finished its job. "<<"\t\t\t\t" << active_thread_num << "threads remains" << endl;
+}
+
+volatile tour_t* divided_tour;
+pthread_cond_t cond_divide_task;
+pthread_mutex_t mutex_divide_task;
+void *tsp(void *tour) {
     tour_stack_t *stack = new tour_stack_t();
+    tour_t *base_tour = (tour_t *) tour;
     node_t *root_city = new node_t(base_tour);
     stack->push(root_city);
     while (!stack->is_empty()) {
+        /*
+         * CPU负载均衡，当活跃线程数比总线程数少时，获取栈底元素（运算量最大的一个tour）新建tsp线程。
+         * 此处也可以自定分割任务的时机，比如当栈的总元素小于10个时才进行分割，减小分割运算量。
+         * */
+        if(active_thread_num < thread_cout && running){
+            if(stack->length>10){
+                pthread_mutex_lock(&mutex_thread_cmd);
+                //等待锁的过程总可能已经有线程修改了线程总数
+                if(active_thread_num < thread_cout){
+                    tour_t *tour = stack->pop_bottom_element()->tour;
+                    if (tour != nullptr) {
+                        pthread_t thread;
+                        pthread_create(&thread, NULL, tsp, tour);
+                        add_thread_num_new_divided(thread);
+                        pthread_join(thread, NULL);
+                    }
+                }
+                pthread_mutex_unlock(&mutex_thread_cmd);
+            }
+        }
         node_t *head = stack->peek();
         stack->pop();
         tour_t *cur_tour = head->tour;
@@ -293,15 +356,17 @@ void * tsp(void *tour){
                 //当前城市可达，且距离小于已有最短距离
                 stack->push(cur_tour->copy_and_insert(i));
 
+
             }
         }
         free(cur_tour);
     }
-
+    sub_thread_num();
 }
 
-tour_queue_t* queue = new tour_queue_t();
-void divide(tour_t* base_tour,int task_num){
+tour_queue_t *queue = new tour_queue_t();
+
+void divide(tour_t *base_tour, int task_num) {
 
     node_t *root_city = new node_t(base_tour);
     queue->push(root_city);
@@ -340,7 +405,7 @@ void divide(tour_t* base_tour,int task_num){
                 //当前城市可达，且距离小于已有最短距离
                 queue->push(cur_tour->copy_and_insert(i));
 
-                if(queue->length >= task_num){
+                if (queue->length >= task_num) {
                     ready = true;
                     break;
                 }
@@ -352,6 +417,7 @@ void divide(tour_t* base_tour,int task_num){
 }
 
 void input() {
+
     for (auto &i : diagram) {
         for (int &j : i) {
             j = INT_MAX;
@@ -368,62 +434,72 @@ void input() {
         diagram[m][n] = d;
     }
     cout << endl;
-    cout<<"----------------------"<<endl;
-    cout<<"Distance Diagram is :"<<endl;
-    cout<<"----------------------"<<endl;
+    cout << "----------------------" << endl;
+    cout << "Distance Diagram is :" << endl;
+    cout << "----------------------" << endl;
 
 
     for (int i = 0; i < city_num; ++i) {
         for (int j = 0; j < city_num; ++j) {
             if (diagram[i][j] == INT_MAX) {
-                cout << setw(OUTPUT_WIDE)<< "-" ;
-            } else { cout<< setw(OUTPUT_WIDE) << diagram[i][j]; }
+                cout << setw(OUTPUT_WIDE) << "-";
+            } else { cout << setw(OUTPUT_WIDE) << diagram[i][j]; }
         }
         cout << endl;
     }
-    cout<<"----------------------"<<endl;
-    cout<<"----------------------"<<endl;
+    cout << "----------------------" << endl;
+    cout << "----------------------" << endl;
 
 
 }
 
 void output() {
-    cout << "The Result Route Is :" << endl;
-    cout << "0";
+    cout << "----------------------" << endl;
+    cout << "----------------------" << endl;
+    cout << "The Shortest Route Is :" << endl;
+    cout << "\t0";
     for (int i = 0; i < city_num - 1; ++i) {
         cout << "->" << best_tour->tour[i];
     }
     cout << "->0" << endl;
-    cout << "Distance: " << endl << best_tour->distance;
+    cout << "Distance: " << endl << '\t' << best_tour->distance<<endl;
 }
 
-void init(){
+void init() {
+    active_thread_num = 0;
     best_tour->distance = INT_MAX;
 }
 
-void* thread_handler(){
-    
+void *thread_handler() {
+
+}
+
+
+void divide_and_conquer() {
+    divide(new tour_t(), CPU_NUM);
+    thread_cout = queue->length;
+    thread_handles = static_cast<pthread_t *>(malloc(thread_cout * sizeof(pthread_t)));
+    cout << "Divided into " << thread_cout << " Tasks" << endl;
+    cout << "----------------------" << endl;
+    cout << "----------------------" << endl;
+    for (int i = 0; i < thread_cout; ++i) {
+        tour_t *tour = queue->peek()->tour;
+        queue->pop();
+        pthread_create(&thread_handles[i], NULL, tsp, tour);
+        add_thread_num(thread_handles[i]);
+    }
+    running = true;
+    for (int i = 0; i < thread_cout; ++i) {
+        pthread_join(thread_handles[i], NULL);
+    }
 }
 
 int main() {
     input();
     init();
-
-    divide(new tour_t(),CPU_NUM);
-    thread_cout = queue->length;
-    thread_handles = static_cast<pthread_t *>(malloc(thread_cout * sizeof(pthread_t)));
-    cout<<"Divided into "<<thread_cout<<" Tasks"<<endl;
-    for (int i = 0; i < thread_cout; ++i) {
-        tour_t* tour = queue->peek()->tour;
-        queue->pop();
-        pthread_create(&thread_handles[i],NULL,tsp,tour);
-    }
-
-    for (int i = 0; i < thread_cout; ++i) {
-        pthread_join(thread_handles[i],NULL);
-    }
-
+    divide_and_conquer();
 //    tsp(new tour_t());
     output();
+    cout<<divide_time<<" times balance function called"<<endl;
     return 0;
 }
